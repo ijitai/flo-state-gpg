@@ -1,0 +1,12 @@
+deps
+build
+bin
+MINGW-*
+GNULINUX-*
+MACOS-*
+*.swp
+*.log
+cscope.out
+Makefile
+.ycm_extra_conf.py
+compiler_options.txt

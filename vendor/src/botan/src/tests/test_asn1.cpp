@@ -1,0 +1,1237 @@
+/*
+* (C) 2017 Jack Lloyd
+*
+* Botan is released under the Simplified BSD License (see license.txt)
+*/
+
+#include "tests.h"
+
+#if defined(BOTAN_HAS_ASN1)
+   #include <botan/asn1_obj.h>
+   #include <botan/asn1_print.h>
+   #include <botan/asn1_time.h>
+   #include <botan/ber_dec.h>
+   #include <botan/bigint.h>
+   #include <botan/data_src.h>
+   #include <botan/der_enc.h>
+   #include <botan/hex.h>
+   #include <botan/pss_params.h>
+   #include <botan/internal/fmt.h>
+   #include <botan/internal/parsing.h>
+#endif
+
+namespace Botan_Tests {
+
+namespace {
+
+#if defined(BOTAN_HAS_ASN1)
+
+class ASN1_Test_Sequence final : public Botan::ASN1_Object {
+   public:
+      explicit ASN1_Test_Sequence(size_t value = 0) : m_value(value) {}
+
+      void encode_into(Botan::DER_Encoder& der) const override { der.start_sequence().encode(m_value).end_cons(); }
+
+      void decode_from(Botan::BER_Decoder& ber) override { ber.start_sequence().decode(m_value).end_cons(); }
+
+      size_t value() const { return m_value; }
+
+   private:
+      size_t m_value;
+};
+
+Test::Result test_ber_stack_recursion() {
+   Test::Result result("BER stack recursion");
+
+   // OSS-Fuzz #813 GitHub #989
+
+   try {
+      const std::vector<uint8_t> in(10000000, 0);
+      Botan::DataSource_Memory input(in.data(), in.size());
+      Botan::BER_Decoder dec(input);
+
+      while(dec.more_items()) {
+         Botan::BER_Object obj;
+         dec.get_next(obj);
+      }
+   } catch(Botan::Decoding_Error&) {}
+
+   result.test_success("No crash");
+
+   return result;
+}
+
+Test::Result test_ber_eoc_decoding_limits() {
+   Test::Result result("BER nested indefinite length");
+
+   // OSS-Fuzz #4353
+
+   const Botan::ASN1_Pretty_Printer printer;
+
+   size_t max_eoc_allowed = 0;
+
+   for(size_t len = 1; len < 1024; ++len) {
+      std::vector<uint8_t> buf(4 * len);
+
+      /*
+      This constructs a len deep sequence of SEQUENCES each with
+      an indefinite length
+      */
+      for(size_t i = 0; i != 2 * len; i += 2) {
+         buf[i] = 0x30;
+         buf[i + 1] = 0x80;
+      }
+      // remainder of values left as zeros (EOC markers)
+
+      try {
+         printer.print(buf);
+      } catch(Botan::BER_Decoding_Error&) {
+         max_eoc_allowed = len - 1;
+         break;
+      }
+   }
+
+   result.test_sz_eq("EOC limited to prevent stack exhaustion", max_eoc_allowed, 16);
+
+   return result;
+}
+
+Test::Result test_ber_standalone_eoc_limits() {
+   Test::Result result("BER standalone EOC handling");
+
+   // Empty SEQUENCE (30 00) followed by a standalone EOC marker (00 00) that
+   // does not terminate any indefinite-length encoding.
+   const std::vector<uint8_t> wire = {0x30, 0x00, 0x00, 0x00};
+
+   auto count_objects = [](const std::vector<uint8_t>& in, Botan::BER_Decoder::Limits limits) {
+      Botan::BER_Decoder dec(in, limits);
+      size_t objects = 0;
+      while(dec.more_items()) {
+         if(dec.get_next_object().is_set()) {
+            objects += 1;
+         }
+      }
+      return objects;
+   };
+
+   // A standalone EOC marker is rejected by default
+   result.test_throws<Botan::Decoding_Error>("standalone EOC rejected by default",
+                                             [&]() { count_objects(wire, Botan::BER_Decoder::Limits::BER()); });
+
+   // ... but tolerated when the decoder is configured to allow it
+   try {
+      const size_t objects = count_objects(wire, Botan::BER_Decoder::Limits::BER().with_standalone_eoc_allowed());
+      result.test_sz_eq("standalone EOC skipped when allowed", objects, 1);
+   } catch(const std::exception& e) {
+      result.test_failure(Botan::fmt("standalone EOC unexpectedly rejected: {}", e.what()));
+   }
+
+   // A constructed encoding of the EOC tag (20 00) is not an EOC marker at
+   // all; it is rejected in every mode, including with the leniency flag
+   const std::vector<uint8_t> cons_eoc = {0x20, 0x00};
+
+   for(auto limits : {Botan::BER_Decoder::Limits::DER(),
+                      Botan::BER_Decoder::Limits::BER(),
+                      Botan::BER_Decoder::Limits::BER().with_standalone_eoc_allowed()}) {
+      result.test_throws<Botan::Decoding_Error>("constructed EOC tag rejected",
+                                                [&]() { count_objects(cons_eoc, limits); });
+   }
+
+   return result;
+}
+
+Test::Result test_ber_max_object_size() {
+   Test::Result result("BER maximum object size");
+
+   // OCTET STRING with 5 content bytes
+   const std::vector<uint8_t> obj = {0x04, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05};
+
+   auto decode = [&](const char* what, Botan::BER_Decoder::Limits limits, bool expect_ok) {
+      try {
+         Botan::BER_Decoder(obj, limits).get_next_object();
+         result.test_bool_eq(what, true, expect_ok);
+      } catch(const Botan::Decoding_Error&) {
+         result.test_bool_eq(what, false, expect_ok);
+      }
+   };
+
+   using Limits = Botan::BER_Decoder::Limits;
+
+   decode("accepted under the default limit", Limits::BER(), true);
+   decode("accepted at exactly the limit", Limits::BER().with_max_object_size(5), true);
+   decode("rejected one byte over the limit", Limits::BER().with_max_object_size(4), false);
+   decode("accepted when the limit is disabled", Limits::BER().with_max_object_size(std::nullopt), true);
+
+   return result;
+}
+
+Test::Result test_ber_constructed_string_decoding() {
+   Test::Result result("BER constructed OCTET/BIT STRING decoding");
+
+   using Botan::ASN1_Class;
+   using Botan::ASN1_Type;
+
+   const auto ber = Botan::BER_Decoder::Limits::BER();
+
+   // Constructed OCTET STRING wrapping two fragments plus an empty one
+   const std::vector<uint8_t> cons_octet = {0x24, 0x09, 0x04, 0x02, 0xAA, 0xBB, 0x04, 0x00, 0x04, 0x01, 0xCC};
+   // The same value using indefinite length
+   const std::vector<uint8_t> cons_octet_indef = {
+      0x24, 0x80, 0x04, 0x02, 0xAA, 0xBB, 0x04, 0x00, 0x04, 0x01, 0xCC, 0x00, 0x00};
+   // The same value with a nested constructed segment holding the last fragment
+   const std::vector<uint8_t> cons_octet_nested = {
+      0x24, 0x0B, 0x04, 0x02, 0xAA, 0xBB, 0x24, 0x80, 0x04, 0x01, 0xCC, 0x00, 0x00};
+   const std::vector<uint8_t> expected_octets = {0xAA, 0xBB, 0xCC};
+
+   for(const auto& input : {cons_octet, cons_octet_indef, cons_octet_nested}) {
+      std::vector<uint8_t> out;
+      Botan::BER_Decoder(input, ber).decode(out, ASN1_Type::OctetString).verify_end();
+      result.test_bin_eq("constructed OCTET STRING concatenated", out, expected_octets);
+   }
+
+   // An implicitly tagged [0] constructed OCTET STRING
+   const std::vector<uint8_t> cons_octet_implicit = {0xA0, 0x07, 0x04, 0x02, 0xAA, 0xBB, 0x04, 0x01, 0xCC};
+   std::vector<uint8_t> implicit_out;
+   Botan::BER_Decoder(cons_octet_implicit, ber)
+      .decode(implicit_out, ASN1_Type::OctetString, ASN1_Type(0), ASN1_Class::ContextSpecific)
+      .verify_end();
+   result.test_bin_eq("implicitly tagged constructed OCTET STRING", implicit_out, expected_octets);
+
+   // Constructed BIT STRING: 8 bits then 4 bits, so the final segment
+   // carries 4 unused bits
+   const std::vector<uint8_t> cons_bits = {0x23, 0x08, 0x03, 0x02, 0x00, 0xAA, 0x03, 0x02, 0x04, 0xB0};
+   Botan::ASN1_BitString bs;
+   Botan::BER_Decoder(cons_bits, ber).decode_bitstring(bs).verify_end();
+   result.test_sz_eq("constructed BIT STRING length", bs.bit_length(), 12);
+   result.test_bin_eq("constructed BIT STRING value", bs.bytes(), std::vector<uint8_t>{0xAA, 0xB0});
+
+   std::vector<uint8_t> bits_out;
+   Botan::BER_Decoder(cons_bits, ber).decode(bits_out, ASN1_Type::BitString).verify_end();
+   result.test_bin_eq("constructed BIT STRING via vector decode", bits_out, std::vector<uint8_t>{0xAA, 0xB0});
+
+   // A constructed string with no segments is an empty string
+   const std::vector<uint8_t> cons_empty = {0x24, 0x00};
+   std::vector<uint8_t> empty_out = {0xFF};
+   Botan::BER_Decoder(cons_empty, ber).decode(empty_out, ASN1_Type::OctetString).verify_end();
+   result.test_sz_eq("empty constructed OCTET STRING", empty_out.size(), 0);
+
+   // Unused bits are only permitted in the final segment (X.690 8.6.4)
+   const std::vector<uint8_t> bad_bits = {0x23, 0x08, 0x03, 0x02, 0x04, 0xA0, 0x03, 0x02, 0x00, 0xBB};
+   result.test_throws<Botan::Decoding_Error>("unused bits before final segment rejected", [&]() {
+      Botan::ASN1_BitString out;
+      Botan::BER_Decoder(bad_bits, ber).decode_bitstring(out);
+   });
+
+   // Segments must have the same string type as the outer object
+   const std::vector<uint8_t> bad_segment = {0x24, 0x04, 0x03, 0x02, 0x00, 0xAA};
+   result.test_throws<Botan::Decoding_Error>("wrong segment type rejected", [&]() {
+      std::vector<uint8_t> out;
+      Botan::BER_Decoder(bad_segment, ber).decode(out, ASN1_Type::OctetString);
+   });
+
+   // Nesting beyond the limit is rejected. This value must match ALLOWED_CONSTRUCTED_STRING_NESTING
+   // in ber_dec.cpp
+   constexpr size_t expected_constr_nesting_allowed = 2;
+
+   for(size_t depth = 0; depth != 16; ++depth) {
+      std::vector<uint8_t> deep = {0x04, 0x01, 0xAA};
+      for(size_t i = 0; i != depth; ++i) {
+         std::vector<uint8_t> wrapped = {0x24, static_cast<uint8_t>(deep.size())};
+         wrapped.insert(wrapped.end(), deep.begin(), deep.end());
+         deep = std::move(wrapped);
+      }
+
+      if(depth <= expected_constr_nesting_allowed) {
+         std::vector<uint8_t> out;
+         Botan::BER_Decoder(deep, ber).decode(out, ASN1_Type::OctetString);
+         result.test_success("BER_Decoder accepted nested encoding");
+         result.test_bin_eq("Constructed matched expected value", out, "AA");
+      } else {
+         result.test_throws<Botan::Decoding_Error>("deeply nested constructed string rejected", [&]() {
+            std::vector<uint8_t> out;
+            Botan::BER_Decoder(deep, ber).decode(out, ASN1_Type::OctetString);
+         });
+      }
+   }
+
+   // DER requires the primitive form, in every code path
+   const auto der = Botan::BER_Decoder::Limits::DER();
+   result.test_throws<Botan::Decoding_Error>("constructed OCTET STRING rejected in DER", [&]() {
+      std::vector<uint8_t> out;
+      Botan::BER_Decoder(cons_octet, der)
+         .decode(out, ASN1_Type::OctetString, ASN1_Type::OctetString, ASN1_Class::Constructed);
+   });
+   result.test_throws<Botan::Decoding_Error>("constructed BIT STRING rejected in DER", [&]() {
+      std::vector<uint8_t> out;
+      Botan::BER_Decoder(cons_bits, der)
+         .decode(out, ASN1_Type::BitString, ASN1_Type::BitString, ASN1_Class::Constructed);
+   });
+   result.test_throws<Botan::Decoding_Error>("constructed BIT STRING rejected in DER via decode_bitstring", [&]() {
+      Botan::ASN1_BitString out;
+      Botan::BER_Decoder(cons_bits, der).decode_bitstring(out, ASN1_Type::BitString, ASN1_Class::Constructed);
+   });
+
+   return result;
+}
+
+Test::Result test_asn1_utf8_ascii_parsing() {
+   Test::Result result("ASN.1 ASCII parsing");
+
+   try {
+      // \x13 - ASN1 tag for 'printable string'
+      // \x06 - 6 characters of payload
+      // ...  - UTF-8 encoded (ASCII chars only) word 'Moscow'
+      const std::string moscow = "\x13\x06\x4D\x6F\x73\x63\x6F\x77";
+      const std::string moscow_plain = "Moscow";
+      Botan::DataSource_Memory input(moscow);
+      Botan::BER_Decoder dec(input);
+
+      Botan::ASN1_String str;
+      str.decode_from(dec);
+
+      result.test_str_eq("value()", str.value(), moscow_plain);
+   } catch(const Botan::Decoding_Error& ex) {
+      result.test_failure(ex.what());
+   }
+
+   return result;
+}
+
+Test::Result test_asn1_utf8_parsing() {
+   Test::Result result("ASN.1 UTF-8 parsing");
+
+   try {
+      // \x0C - ASN1 tag for 'UTF8 string'
+      // \x0C - 12 characters of payload
+      // ...  - UTF-8 encoded russian word for Moscow in cyrillic script
+      const std::string moscow = "\x0C\x0C\xD0\x9C\xD0\xBE\xD1\x81\xD0\xBA\xD0\xB2\xD0\xB0";
+      const std::string moscow_plain = "\xD0\x9C\xD0\xBE\xD1\x81\xD0\xBA\xD0\xB2\xD0\xB0";
+      Botan::DataSource_Memory input(moscow);
+      Botan::BER_Decoder dec(input);
+
+      Botan::ASN1_String str;
+      str.decode_from(dec);
+
+      result.test_str_eq("value()", str.value(), moscow_plain);
+   } catch(const Botan::Decoding_Error& ex) {
+      result.test_failure(ex.what());
+   }
+
+   return result;
+}
+
+Test::Result test_asn1_ucs2_parsing() {
+   Test::Result result("ASN.1 BMP string (UCS-2) parsing");
+
+   try {
+      // \x1E     - ASN1 tag for 'BMP (UCS-2) string'
+      // \x0C     - 12 characters of payload
+      // ...      - UCS-2 encoding for Moscow in cyrillic script
+      const std::string moscow = "\x1E\x0C\x04\x1C\x04\x3E\x04\x41\x04\x3A\x04\x32\x04\x30";
+      const std::string moscow_plain = "\xD0\x9C\xD0\xBE\xD1\x81\xD0\xBA\xD0\xB2\xD0\xB0";
+
+      Botan::DataSource_Memory input(moscow);
+      Botan::BER_Decoder dec(input);
+
+      Botan::ASN1_String str;
+      str.decode_from(dec);
+
+      result.test_str_eq("value()", str.value(), moscow_plain);
+   } catch(const Botan::Decoding_Error& ex) {
+      result.test_failure(ex.what());
+   }
+
+   return result;
+}
+
+Test::Result test_asn1_ucs4_parsing() {
+   Test::Result result("ASN.1 universal string (UCS-4) parsing");
+
+   try {
+      // \x1C - ASN1 tag for 'universal string'
+      // \x18 - 24 characters of payload
+      // ...  - UCS-4 encoding for Moscow in cyrillic script
+      const uint8_t moscow[] =
+         "\x1C\x18\x00\x00\x04\x1C\x00\x00\x04\x3E\x00\x00\x04\x41\x00\x00\x04\x3A\x00\x00\x04\x32\x00\x00\x04\x30";
+      const std::string moscow_plain = "\xD0\x9C\xD0\xBE\xD1\x81\xD0\xBA\xD0\xB2\xD0\xB0";
+      Botan::DataSource_Memory input(moscow, sizeof(moscow));
+      Botan::BER_Decoder dec(input);
+
+      Botan::ASN1_String str;
+      str.decode_from(dec);
+
+      result.test_str_eq("value()", str.value(), moscow_plain);
+   } catch(const Botan::Decoding_Error& ex) {
+      result.test_failure(ex.what());
+   }
+
+   return result;
+}
+
+Test::Result test_asn1_ucs_invalid_codepoint_rejection() {
+   Test::Result result("ASN.1 UCS-2/UCS-4 invalid codepoint rejection");
+
+   auto expect_decode_throws = [&](const char* what, const std::vector<uint8_t>& wire) {
+      result.test_throws(what, [&]() {
+         Botan::DataSource_Memory input(wire.data(), wire.size());
+         Botan::BER_Decoder dec(input);
+         Botan::ASN1_String str;
+         str.decode_from(dec);
+      });
+   };
+
+   auto expect_decode_ok = [&](const char* what, const std::vector<uint8_t>& wire) {
+      try {
+         Botan::DataSource_Memory input(wire.data(), wire.size());
+         Botan::BER_Decoder dec(input);
+         Botan::ASN1_String str;
+         str.decode_from(dec);
+         result.test_success(what);
+      } catch(const std::exception& ex) {
+         result.test_failure(Botan::fmt("{}: unexpected throw: {}", what, ex.what()));
+      }
+   };
+
+   // UniversalString (tag 0x1C) with codepoint 0x00110000 - one past Unicode max
+   expect_decode_throws("UniversalString rejects codepoint > 0x10FFFF", {0x1C, 0x04, 0x00, 0x11, 0x00, 0x00});
+
+   // UniversalString with codepoint 0xFFFFFFFF (clearly out of range)
+   expect_decode_throws("UniversalString rejects codepoint 0xFFFFFFFF", {0x1C, 0x04, 0xFF, 0xFF, 0xFF, 0xFF});
+
+   // UniversalString with high surrogate 0xD800
+   expect_decode_throws("UniversalString rejects surrogate codepoint", {0x1C, 0x04, 0x00, 0x00, 0xD8, 0x00});
+
+   // UniversalString boundary case: 0x10FFFF is the highest valid codepoint
+   expect_decode_ok("UniversalString accepts codepoint 0x10FFFF", {0x1C, 0x04, 0x00, 0x10, 0xFF, 0xFF});
+
+   // BmpString (tag 0x1E) with high surrogate
+   expect_decode_throws("BmpString rejects surrogate codepoint", {0x1E, 0x02, 0xD8, 0x00});
+
+   // BmpString with odd length is malformed
+   expect_decode_throws("BmpString rejects odd-length payload", {0x1E, 0x03, 0x00, 0x41, 0x00});
+
+   // UniversalString with non-multiple-of-4 length is malformed
+   expect_decode_throws("UniversalString rejects non-multiple-of-4 payload",
+                        {0x1C, 0x05, 0x00, 0x00, 0x00, 0x41, 0x00});
+
+   return result;
+}
+
+Test::Result test_asn1_ascii_encoding() {
+   Test::Result result("ASN.1 ASCII encoding");
+
+   try {
+      // UTF-8 encoded (ASCII chars only) word 'Moscow'
+      const std::string moscow = "Moscow";
+      const Botan::ASN1_String str(moscow);
+
+      Botan::DER_Encoder enc;
+
+      str.encode_into(enc);
+      auto encodingResult = enc.get_contents();
+
+      // \x13 - ASN1 tag for 'printable string'
+      // \x06 - 6 characters of payload
+      result.test_bin_eq("encoding result", encodingResult, "13064D6F73636F77");
+
+      result.test_success("No crash");
+   } catch(const std::exception& ex) {
+      result.test_failure(ex.what());
+   }
+
+   return result;
+}
+
+Test::Result test_asn1_utf8_encoding() {
+   Test::Result result("ASN.1 UTF-8 encoding");
+
+   try {
+      // UTF-8 encoded russian word for Moscow in cyrillic script
+      const std::string moscow = "\xD0\x9C\xD0\xBE\xD1\x81\xD0\xBA\xD0\xB2\xD0\xB0";
+      const Botan::ASN1_String str(moscow);
+
+      Botan::DER_Encoder enc;
+
+      str.encode_into(enc);
+      auto encodingResult = enc.get_contents();
+
+      // \x0C - ASN1 tag for 'UTF8 string'
+      // \x0C - 12 characters of payload
+      result.test_bin_eq("encoding result", encodingResult, "0C0CD09CD0BED181D0BAD0B2D0B0");
+
+      result.test_success("No crash");
+   } catch(const std::exception& ex) {
+      result.test_failure(ex.what());
+   }
+
+   return result;
+}
+
+Test::Result test_asn1_tag_underlying_type() {
+   Test::Result result("ASN.1 class and type underlying type");
+
+   if constexpr(std::is_same_v<std::underlying_type_t<Botan::ASN1_Class>, std::underlying_type_t<Botan::ASN1_Type>>) {
+      if constexpr(!std::is_same_v<std::underlying_type_t<Botan::ASN1_Class>,
+                                   std::invoke_result_t<decltype(&Botan::BER_Object::tagging), Botan::BER_Object>>) {
+         result.test_failure(
+            "Return type of BER_Object::tagging() is different than the underlying type of ASN1_Class");
+      } else {
+         result.test_success("Same types");
+      }
+   } else {
+      result.test_failure("ASN1_Class and ASN1_Type have different underlying types");
+   }
+
+   return result;
+}
+
+Test::Result test_asn1_high_tag_number() {
+   Test::Result result("ASN.1 high tag number encode/decode");
+
+   // The encoder emits high-tag-number encodings for the full uint32_t range,
+   // so the decoder must round trip the same range.
+   const std::vector<uint8_t> content = {0x01, 0x02, 0x03};
+
+   const uint32_t tags[] = {31, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, 0xFFFFFFFF};
+
+   for(const uint32_t tag : tags) {
+      Botan::DER_Encoder enc;
+      // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
+      enc.add_object(static_cast<Botan::ASN1_Type>(tag), Botan::ASN1_Class::ContextSpecific, content);
+      const auto der = enc.get_contents_unlocked();
+
+      try {
+         const Botan::BER_Object obj = Botan::BER_Decoder(der).get_next_object();
+         result.test_sz_eq("decoded tag matches encoded tag", static_cast<uint32_t>(obj.type()), tag);
+      } catch(const std::exception& e) {
+         result.test_failure(Botan::fmt("tag {} unexpectedly rejected: {}", tag, e.what()));
+      }
+   }
+
+   // A tag value that does not fit in uint32_t (here 2^32, encoded as
+   // 1F 90 80 80 80 00) must be rejected rather than silently truncated.
+   const std::vector<uint8_t> overflow_tag = {0x1F, 0x90, 0x80, 0x80, 0x80, 0x00};
+   result.test_throws<Botan::Decoding_Error>("over-uint32 tag rejected",
+                                             [&]() { Botan::BER_Decoder(overflow_tag).get_next_object(); });
+
+   return result;
+}
+
+Test::Result test_asn1_negative_int_encoding() {
+   Test::Result result("DER encode/decode of negative integers");
+
+   BigInt n(32);
+
+   for(size_t i = 0; i != 2048; ++i) {
+      n--;
+
+      const auto enc = Botan::DER_Encoder().encode(n).get_contents_unlocked();
+
+      BigInt n_dec;
+      Botan::BER_Decoder(enc, Botan::BER_Decoder::Limits::DER()).decode(n_dec);
+
+      result.test_bn_eq("DER encoding round trips negative integers", n_dec, n);
+   }
+
+   return result;
+}
+
+Test::Result test_der_set_ordering() {
+   Test::Result result("DER SET ordering validation");
+
+   using Limits = Botan::BER_Decoder::Limits;
+
+   // SET { INTEGER 1, INTEGER 2 } - canonically sorted
+   const std::vector<uint8_t> sorted_set = {0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02};
+   // SET { INTEGER 2, INTEGER 1 } - elements out of order
+   const std::vector<uint8_t> unsorted_set = {0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01};
+
+   auto decode_set = [](const std::vector<uint8_t>& wire, Limits limits) {
+      Botan::BER_Decoder dec(wire, limits);
+      Botan::BER_Decoder set = dec.start_set();
+      while(set.more_items()) {
+         Botan::BigInt v;
+         set.decode(v);
+      }
+      set.end_cons();
+   };
+
+   // A sorted SET is accepted in both modes
+   try {
+      decode_set(sorted_set, Limits::DER());
+      decode_set(sorted_set, Limits::BER());
+      result.test_success("sorted SET accepted");
+   } catch(const std::exception& e) {
+      result.test_failure(Botan::fmt("sorted SET unexpectedly rejected: {}", e.what()));
+   }
+
+   // An unsorted SET is rejected in DER mode ...
+   result.test_throws<Botan::Decoding_Error>("unsorted SET rejected in DER mode",
+                                             [&]() { decode_set(unsorted_set, Limits::DER()); });
+
+   // ... but accepted in BER mode (canonical ordering is a DER requirement)
+   try {
+      decode_set(unsorted_set, Limits::BER());
+      result.test_success("unsorted SET accepted in BER mode");
+   } catch(const std::exception& e) {
+      result.test_failure(Botan::fmt("unsorted SET unexpectedly rejected in BER mode: {}", e.what()));
+   }
+
+   return result;
+}
+
+Test::Result test_der_constructed_tag_17_not_sorted() {
+   Test::Result result("DER constructed [17] is not SET-sorted");
+
+   // Two INTEGERs in descending order. A universal SET would lex-sort and put
+   // 0x01 before 0x02; a non-universal constructed [17] must preserve order.
+   const std::vector<uint8_t> first = {0x02, 0x01, 0x02};   // INTEGER 2
+   const std::vector<uint8_t> second = {0x02, 0x01, 0x01};  // INTEGER 1
+
+   auto encode_with = [&](auto starter) {
+      Botan::DER_Encoder enc;
+      starter(enc).raw_bytes(first).raw_bytes(second).end_cons();
+      return enc.get_contents_unlocked();
+   };
+
+   // Reference: a universal SET of the same children gets sorted
+   const auto set_enc = encode_with([](Botan::DER_Encoder& e) -> Botan::DER_Encoder& { return e.start_set(); });
+   const std::vector<uint8_t> set_expected = {0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02};
+   result.test_bin_eq("universal SET is lex-sorted", set_enc, set_expected);
+
+   // start_context_specific(17): tag byte = ContextSpecific | Constructed | 17 = 0xB1
+   const auto ctx_enc =
+      encode_with([](Botan::DER_Encoder& e) -> Botan::DER_Encoder& { return e.start_context_specific(17); });
+   const std::vector<uint8_t> ctx_expected = {0xB1, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01};
+   result.test_bin_eq("context-specific [17] preserves order", ctx_enc, ctx_expected);
+
+   // start_explicit_context_specific(17): same tag byte 0xB1
+   const auto explicit_ctx_enc =
+      encode_with([](Botan::DER_Encoder& e) -> Botan::DER_Encoder& { return e.start_explicit_context_specific(17); });
+   result.test_bin_eq("explicit context-specific [17] preserves order", explicit_ctx_enc, ctx_expected);
+
+   // start_explicit(17): used to throw Internal_Error; must now produce [17] in order
+   const auto explicit_enc =
+      encode_with([](Botan::DER_Encoder& e) -> Botan::DER_Encoder& { return e.start_explicit(17); });
+   result.test_bin_eq("start_explicit(17) preserves order", explicit_enc, ctx_expected);
+
+   return result;
+}
+
+Test::Result test_der_implicit_tagging_helpers() {
+   Test::Result result("DER implicit tagging helpers");
+
+   const std::vector<uint8_t> first = {0x02, 0x01, 0x02};   // INTEGER 2
+   const std::vector<uint8_t> second = {0x02, 0x01, 0x01};  // INTEGER 1
+
+   Botan::DER_Encoder set_enc;
+   set_enc.start_set(23).raw_bytes(first).raw_bytes(second).end_cons();
+   const auto implicit_set = set_enc.get_contents_unlocked();
+   result.test_bin_eq("implicit SET is still sorted", implicit_set, "B706020101020102");
+
+   const ASN1_Test_Sequence seq(42);
+   const auto implicit_seq = Botan::DER_Encoder().encode_implicit(seq, Botan::ASN1_Type(3)).get_contents_unlocked();
+   result.test_bin_eq("implicit constructed object keeps constructed bit", implicit_seq, "A30302012A");
+
+   ASN1_Test_Sequence decoded;
+   Botan::BER_Decoder(implicit_seq, Botan::BER_Decoder::Limits::DER())
+      .decode_implicit(decoded,
+                       Botan::ASN1_Type(3),
+                       Botan::ASN1_Class::ContextSpecific | Botan::ASN1_Class::Constructed,
+                       Botan::ASN1_Type::Sequence,
+                       Botan::ASN1_Class::Constructed)
+      .verify_end();
+   result.test_sz_eq("implicit constructed object decodes", decoded.value(), 42);
+
+   const std::vector<uint8_t> one_bit = {0x80};
+   const auto implicit_bitstring =
+      Botan::DER_Encoder()
+         .encode_bitstring(one_bit, 7, Botan::ASN1_Type(1), Botan::ASN1_Class::ContextSpecific)
+         .get_contents_unlocked();
+   result.test_bin_eq("implicit BIT STRING keeps unused bit count", implicit_bitstring, "81020780");
+
+   const std::vector<uint8_t> bad_padding = {0x81};
+   result.test_throws<Botan::Invalid_Argument>("BIT STRING unused bits must be zero",
+                                               [&] { Botan::DER_Encoder().encode_bitstring(bad_padding, 7); });
+
+   return result;
+}
+
+Test::Result test_asn1_bitstring_helpers() {
+   Test::Result result("ASN.1 BIT STRING helpers");
+
+   const std::vector<uint8_t> raw_der = {0x03, 0x03, 0x03, 0xA8, 0x00};
+   Botan::ASN1_BitString raw_bits;
+   Botan::BER_Decoder(raw_der, Botan::BER_Decoder::Limits::DER()).decode_bitstring(raw_bits).verify_end();
+
+   result.test_sz_eq("raw bytes", raw_bits.bytes().size(), 2);
+   result.test_sz_eq("raw unused bits", raw_bits.unused_bits(), 3);
+   result.test_sz_eq("raw bit length", raw_bits.bit_length(), 13);
+   result.test_is_true("raw bit 0", raw_bits.bit_at(0));
+   result.test_is_false("raw bit 1", raw_bits.bit_at(1));
+   result.test_is_true("raw bit 2", raw_bits.bit_at(2));
+
+   const auto raw_reencoded = Botan::DER_Encoder().encode_bitstring(raw_bits).get_contents_unlocked();
+   result.test_bin_eq("raw BIT STRING re-encodes", raw_reencoded, raw_der);
+
+   const std::vector<uint8_t> octet_aligned_der = {0x03, 0x02, 0x00, 0xAA};
+   std::vector<uint8_t> octets;
+   Botan::BER_Decoder(octet_aligned_der, Botan::BER_Decoder::Limits::DER())
+      .decode_octet_aligned_bitstring(octets)
+      .verify_end();
+   const std::vector<uint8_t> expected_octets = {0xAA};
+   result.test_bin_eq("octet-aligned BIT STRING decodes as bytes", octets, expected_octets);
+
+   const std::vector<uint8_t> non_octet_aligned_der = {0x03, 0x02, 0x01, 0x80};
+   result.test_throws<Botan::Decoding_Error>("octet-aligned BIT STRING rejects unused bits", [&] {
+      std::vector<uint8_t> rejected;
+      Botan::BER_Decoder(non_octet_aligned_der, Botan::BER_Decoder::Limits::DER())
+         .decode_octet_aligned_bitstring(rejected)
+         .verify_end();
+   });
+
+   const uint64_t named = (uint64_t(1) << 15) | (uint64_t(1) << 7);
+   const auto named_der = Botan::DER_Encoder().encode_named_bitstring(named, 16).get_contents_unlocked();
+   const std::vector<uint8_t> expected_named_der = {0x03, 0x03, 0x07, 0x80, 0x80};
+   result.test_bin_eq("named BIT STRING uses DER minimum length", named_der, expected_named_der);
+
+   uint64_t decoded_named = 0;
+   Botan::BER_Decoder(named_der, Botan::BER_Decoder::Limits::DER())
+      .decode_named_bitstring(decoded_named, 16)
+      .verify_end();
+   result.test_u64_eq("named BIT STRING round-trips", decoded_named, named);
+
+   const auto width9_der = Botan::DER_Encoder().encode_named_bitstring(1, 9).get_contents_unlocked();
+   const std::vector<uint8_t> expected_width9_der = {0x03, 0x03, 0x07, 0x00, 0x80};
+   result.test_bin_eq("named BIT STRING handles non-byte width", width9_der, expected_width9_der);
+
+   const std::vector<uint8_t> non_minimal_named_der = {0x03, 0x02, 0x00, 0x80};
+   result.test_throws<Botan::BER_Decoding_Error>("DER named BIT STRING rejects trailing zero bits", [&] {
+      uint64_t rejected = 0;
+      Botan::BER_Decoder(non_minimal_named_der, Botan::BER_Decoder::Limits::DER())
+         .decode_named_bitstring(rejected, 16)
+         .verify_end();
+   });
+
+   uint64_t non_minimal_named = 0;
+   Botan::BER_Decoder(non_minimal_named_der, Botan::BER_Decoder::Limits::BER())
+      .decode_named_bitstring(non_minimal_named, 16)
+      .verify_end();
+   result.test_u64_eq("BER named BIT STRING accepts trailing zero bits", non_minimal_named, uint64_t(1) << 15);
+
+   return result;
+}
+
+Test::Result test_ber_indefinite_length_trailing_data() {
+   Test::Result result("BER indefinite length trailing data");
+
+   // Case 1: verify_end after consuming indef SEQUENCE
+   try {
+      const std::vector<uint8_t> enc = {0x30, 0x80, 0x02, 0x01, 0x42, 0x00, 0x00};
+      Botan::BER_Decoder dec(enc);
+      Botan::BigInt x;
+      dec.start_sequence().decode(x).end_cons();
+      dec.verify_end();
+      result.test_bn_eq("verify_end decoded x", x, Botan::BigInt(0x42));
+   } catch(Botan::Exception& e) {
+      result.test_failure("verify_end after indef SEQUENCE", e.what());
+   }
+
+   // Case 2: two back-to-back indef SEQUENCES at top level
+   try {
+      const std::vector<uint8_t> enc = {
+         0x30, 0x80, 0x02, 0x01, 0x42, 0x00, 0x00, 0x30, 0x80, 0x02, 0x01, 0x43, 0x00, 0x00};
+      Botan::BER_Decoder dec(enc);
+      Botan::BigInt x;
+      Botan::BigInt y;
+      dec.start_sequence().decode(x).end_cons();
+      dec.start_sequence().decode(y).end_cons();
+      dec.verify_end();
+      result.test_bn_eq("back-to-back x", x, Botan::BigInt(0x42));
+      result.test_bn_eq("back-to-back y", y, Botan::BigInt(0x43));
+   } catch(Botan::Exception& e) {
+      result.test_failure("two back-to-back indef SEQUENCES", e.what());
+   }
+
+   // Case 3: nested indef SEQUENCES
+   try {
+      const std::vector<uint8_t> enc = {0x30, 0x80, 0x30, 0x80, 0x02, 0x01, 0x42, 0x00, 0x00, 0x00, 0x00};
+      Botan::BER_Decoder dec(enc);
+      Botan::BigInt x;
+      auto outer = dec.start_sequence();
+      outer.start_sequence().decode(x).end_cons();
+      outer.end_cons();
+      dec.verify_end();
+      result.test_bn_eq("nested x", x, Botan::BigInt(0x42));
+   } catch(Botan::Exception& e) {
+      result.test_failure("nested indef SEQUENCE", e.what());
+   }
+
+   // Case 4: while(more_items()) loop over an indef SEQUENCE
+   try {
+      const std::vector<uint8_t> enc = {0x30, 0x80, 0x02, 0x01, 0x42, 0x02, 0x01, 0x43, 0x00, 0x00};
+      Botan::BER_Decoder dec(enc);
+      auto seq = dec.start_sequence();
+      std::vector<Botan::BigInt> xs;
+      while(seq.more_items()) {
+         Botan::BigInt x;
+         seq.decode(x);
+         xs.push_back(x);
+      }
+      seq.end_cons();
+      dec.verify_end();
+      result.test_sz_eq("more_items count", xs.size(), 2);
+      if(xs.size() == 2) {
+         result.test_bn_eq("more_items xs[0]", xs[0], Botan::BigInt(0x42));
+         result.test_bn_eq("more_items xs[1]", xs[1], Botan::BigInt(0x43));
+      }
+   } catch(Botan::Exception& e) {
+      result.test_failure("more_items loop over indef SEQUENCE", e.what());
+   }
+
+   return result;
+}
+
+Test::Result test_ber_find_eoc() {
+   Test::Result result("BER indefinite length EOC matching");
+
+   const size_t num_siblings = 4096;
+
+   std::vector<uint8_t> ber;
+   ber.push_back(0x30);  // outer SEQUENCE | CONSTRUCTED
+   ber.push_back(0x80);  // indefinite length
+   for(size_t i = 0; i != num_siblings; ++i) {
+      ber.push_back(0x30);  // inner SEQUENCE | CONSTRUCTED
+      ber.push_back(0x80);  // indefinite length
+      ber.push_back(0x00);  // EOC tag
+      ber.push_back(0x00);  // EOC length
+   }
+   ber.push_back(0x00);  // outer EOC tag
+   ber.push_back(0x00);  // outer EOC length
+
+   try {
+      Botan::BER_Decoder dec(ber);
+      const Botan::BER_Object obj = dec.get_next_object();
+
+      result.test_sz_eq("object body includes children", obj.length(), num_siblings * 4);
+   } catch(Botan::Exception& e) {
+      result.test_failure("decode failed", e.what());
+   }
+
+   return result;
+}
+
+Test::Result test_asn1_string_zero_length_roundtrip() {
+   Test::Result result("ASN.1 String zero-length round-trip");
+
+   auto roundtrip = [&](const char* what, const std::vector<uint8_t>& wire) {
+      try {
+         Botan::DataSource_Memory input(wire.data(), wire.size());
+         Botan::BER_Decoder dec(input);
+         Botan::ASN1_String str;
+         str.decode_from(dec);
+
+         Botan::DER_Encoder enc;
+         str.encode_into(enc);
+         const auto out = enc.get_contents();
+         result.test_bin_eq(what, std::span{out}, std::span{wire});
+      } catch(const std::exception& ex) {
+         result.test_failure(Botan::fmt("{}: unexpected throw: {}", what, ex.what()));
+      }
+   };
+
+   roundtrip("BmpString 1E 00", {0x1E, 0x00});
+   roundtrip("UniversalString 1C 00", {0x1C, 0x00});
+   roundtrip("TeletexString 14 00", {0x14, 0x00});
+
+   return result;
+}
+
+Test::Result test_pss_params_rejects_trailing_data_in_mgf1_params() {
+   Test::Result result("PSS-Params rejects trailing data in MGF1 parameters");
+
+   const Botan::AlgorithmIdentifier sha256_alg_id("SHA-256", Botan::AlgorithmIdentifier::USE_NULL_PARAM);
+   const auto sha256_der = sha256_alg_id.BER_encode();
+
+   auto encode_pss_params = [&](const std::vector<uint8_t>& mgf_params) {
+      const Botan::AlgorithmIdentifier mgf("MGF1", mgf_params);
+      Botan::DER_Encoder enc;
+      enc.start_sequence()
+         .start_context_specific(0)
+         .encode(sha256_alg_id)
+         .end_cons()
+         .start_context_specific(1)
+         .encode(mgf)
+         .end_cons()
+         .start_context_specific(2)
+         .encode(static_cast<size_t>(32))
+         .end_cons()
+         .end_cons();
+      return enc.get_contents();
+   };
+
+   try {
+      const auto clean_der = encode_pss_params(sha256_der);
+      const Botan::PSS_Params clean(clean_der);
+      result.test_success("control: clean PSS-Params decodes");
+   } catch(const std::exception& e) {
+      result.test_failure(Botan::fmt("clean PSS-Params unexpected throw: {}", e.what()));
+   }
+
+   std::vector<uint8_t> mgf_params_with_junk = sha256_der;
+   const std::vector<uint8_t> trailing_junk{0x02, 0x01, 0x00};
+   mgf_params_with_junk.insert(mgf_params_with_junk.end(), trailing_junk.begin(), trailing_junk.end());
+   const auto bad_der = encode_pss_params(mgf_params_with_junk);
+
+   result.test_throws<Botan::Decoding_Error>("PSS-Params rejects trailing data in MGF1 parameters",
+                                             [&]() { const Botan::PSS_Params bad(bad_der); });
+
+   return result;
+}
+
+Test::Result test_alg_id_parameter_validation() {
+   Test::Result result("AlgorithmIdentifier parameter validation");
+
+   auto decode_alg_id = [](std::string_view hex) {
+      const auto wire = Botan::hex_decode(hex);
+      Botan::AlgorithmIdentifier alg_id;
+      Botan::BER_Decoder(wire).decode(alg_id).verify_end();
+   };
+
+   auto verify_params_accepted = [&](const std::string& label, std::string_view hex) {
+      try {
+         decode_alg_id(hex);
+         result.test_success(Botan::fmt("{} parameters accepted", label));
+      } catch(const std::exception& e) {
+         result.test_failure(Botan::fmt("{} parameters unexpectedly rejected: {}", label, e.what()));
+      }
+   };
+
+   auto verify_params_rejected = [&](const std::string& label, std::string_view hex) {
+      result.test_throws<Botan::Decoding_Error>(Botan::fmt("{} parameters rejected", label),
+                                                [&]() { decode_alg_id(hex); });
+   };
+
+   // The wire is SEQUENCE { OID 2.5.4.3, <parameters> } in each case
+
+   verify_params_accepted("absent", "30050603550403");
+   verify_params_accepted("NULL", "300706035504030500");
+   verify_params_accepted("SEQUENCE", "300706035504033000");
+   verify_params_accepted("OID", "300A06035504030603550403");
+   verify_params_accepted("OCTET STRING", "300906035504030402AABB");
+
+   verify_params_rejected("two values (NULL, NULL)", "3009060355040305000500");
+   verify_params_rejected("trailing data after NULL", "300A06035504030500020100");
+   verify_params_rejected("truncated SEQUENCE", "300706035504033005");
+   verify_params_rejected("single INTEGER", "30080603550403020100");
+
+   return result;
+}
+
+Test::Result test_der_default_value_encoding() {
+   Test::Result result("DER DEFAULT value rejection");
+
+   using Limits = Botan::BER_Decoder::Limits;
+
+   // SEQUENCE { version INTEGER DEFAULT 0 } in three forms
+   const std::vector<uint8_t> present_default = {0x30, 0x03, 0x02, 0x01, 0x00};     // present, == default
+   const std::vector<uint8_t> omitted = {0x30, 0x00};                               // absent
+   const std::vector<uint8_t> present_nondefault = {0x30, 0x03, 0x02, 0x01, 0x05};  // present, != default
+
+   auto decode_version = [](const std::vector<uint8_t>& wire, Limits limits) {
+      Botan::BER_Decoder dec(wire, limits);
+      size_t version = 99;
+      dec.start_sequence()
+         .decode_default(version, Botan::ASN1_Type::Integer, Botan::ASN1_Class::Universal, size_t(0))
+         .end_cons();
+      return version;
+   };
+
+   // By default an explicitly-encoded default value is accepted
+   try {
+      result.test_sz_eq("present default accepted (lax)", decode_version(present_default, Limits::DER()), 0);
+      result.test_sz_eq("omitted uses default (lax)", decode_version(omitted, Limits::DER()), 0);
+      result.test_sz_eq("present non-default decoded", decode_version(present_nondefault, Limits::DER()), 5);
+   } catch(const std::exception& e) {
+      result.test_failure(Botan::fmt("unexpected rejection: {}", e.what()));
+   }
+
+   // With the flag set, a present default-valued component is rejected ...
+   result.test_throws<Botan::Decoding_Error>("present default rejected (strict)", [&]() {
+      decode_version(present_default, Limits::DER().with_default_value_encoding_rejected());
+   });
+
+   // ... but omitted and non-default forms are still accepted
+   try {
+      const auto strict = Limits::DER().with_default_value_encoding_rejected();
+      result.test_sz_eq("omitted uses default (strict)", decode_version(omitted, strict), 0);
+      result.test_sz_eq("present non-default accepted (strict)", decode_version(present_nondefault, strict), 5);
+   } catch(const std::exception& e) {
+      result.test_failure(Botan::fmt("unexpected strict rejection: {}", e.what()));
+   }
+
+   return result;
+}
+
+class ASN1_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         std::vector<Test::Result> results;
+
+         results.push_back(test_ber_stack_recursion());
+         results.push_back(test_ber_eoc_decoding_limits());
+         results.push_back(test_ber_standalone_eoc_limits());
+         results.push_back(test_ber_max_object_size());
+         results.push_back(test_ber_constructed_string_decoding());
+         results.push_back(test_ber_indefinite_length_trailing_data());
+         results.push_back(test_ber_find_eoc());
+         results.push_back(test_asn1_utf8_ascii_parsing());
+         results.push_back(test_asn1_utf8_parsing());
+         results.push_back(test_asn1_ucs2_parsing());
+         results.push_back(test_asn1_ucs4_parsing());
+         results.push_back(test_asn1_ucs_invalid_codepoint_rejection());
+         results.push_back(test_asn1_ascii_encoding());
+         results.push_back(test_asn1_utf8_encoding());
+         results.push_back(test_asn1_tag_underlying_type());
+         results.push_back(test_asn1_high_tag_number());
+         results.push_back(test_asn1_negative_int_encoding());
+         results.push_back(test_der_set_ordering());
+         results.push_back(test_der_constructed_tag_17_not_sorted());
+         results.push_back(test_der_implicit_tagging_helpers());
+         results.push_back(test_asn1_bitstring_helpers());
+         results.push_back(test_asn1_string_zero_length_roundtrip());
+         results.push_back(test_pss_params_rejects_trailing_data_in_mgf1_params());
+         results.push_back(test_alg_id_parameter_validation());
+         results.push_back(test_der_default_value_encoding());
+
+         return results;
+      }
+};
+
+BOTAN_REGISTER_TEST("asn1", "asn1_encoding", ASN1_Tests);
+
+class ASN1_Time_Parsing_Tests final : public Text_Based_Test {
+   public:
+      ASN1_Time_Parsing_Tests() : Text_Based_Test("asn1_time.vec", "Tspec") {}
+
+      Test::Result run_one_test(const std::string& tag_str, const VarMap& vars) override {
+         Test::Result result("ASN.1 date parsing");
+
+         const std::string tspec = vars.get_req_str("Tspec");
+
+         if(tag_str != "UTC" && tag_str != "UTC.invalid" && tag_str != "Generalized" &&
+            tag_str != "Generalized.invalid") {
+            throw Test_Error("Invalid tag value in ASN1 date parsing test");
+         }
+
+         const bool out_of_range = [&]() -> bool {
+            if(tspec.size() == 15) {
+               const size_t year = Botan::to_u32bit(std::string_view(tspec).substr(0, 4));
+               if(year >= 2262) {
+                  return true;
+               }
+               if(year >= 2038 && sizeof(time_t) == 4) {
+                  return true;
+               }
+            }
+
+            return false;
+         }();
+
+         const Botan::ASN1_Type tag = (tag_str == "UTC" || tag_str == "UTC.invalid")
+                                         ? Botan::ASN1_Type::UtcTime
+                                         : Botan::ASN1_Type::GeneralizedTime;
+
+         const bool valid = tag_str.find(".invalid") == std::string::npos;
+
+         if(valid) {
+            const Botan::ASN1_Time time(tspec, tag);
+            result.test_success("Accepted valid time");
+
+            try {
+               const auto std_timepoint = time.to_std_timepoint();
+               result.test_success("Was able to convert time to std timepoint");
+
+               const auto from_std_timepoint = Botan::ASN1_Time::from_time_point(std_timepoint);
+               result.test_is_true("ASN1_Time from std timepoint matches input", from_std_timepoint == time);
+            } catch(std::exception& e) {
+               if(out_of_range) {
+                  result.test_str_contains("Exception message", e.what(), "time is outside the representable range");
+               } else {
+                  result.test_failure("Was not able to convert time to std timepoint", e.what());
+               }
+            }
+         } else {
+            result.test_throws("Invalid time rejected", [=]() { const Botan::ASN1_Time time(tspec, tag); });
+         }
+
+         return result;
+      }
+};
+
+BOTAN_REGISTER_TEST("asn1", "asn1_time", ASN1_Time_Parsing_Tests);
+
+class ASN1_String_Validation_Tests final : public Text_Based_Test {
+   public:
+      ASN1_String_Validation_Tests() :
+            Text_Based_Test("asn1_string_validation.vec",
+                            "Input,ValidNumeric,ValidPrintable,ValidIa5,ValidVisible,ValidUtf8") {}
+
+      Test::Result run_one_test(const std::string& /*header*/, const VarMap& vars) override {
+         Test::Result result("ASN.1 string validation");
+
+         const auto input = vars.get_req_str("Input");
+         const bool valid_numeric = vars.get_req_bool("ValidNumeric");
+         const bool valid_printable = vars.get_req_bool("ValidPrintable");
+         const bool valid_ia5 = vars.get_req_bool("ValidIa5");
+         const bool valid_visible = vars.get_req_bool("ValidVisible");
+         const bool valid_utf8 = vars.get_req_bool("ValidUtf8");
+
+         test_string_type(result, input, "NumericString", Botan::ASN1_Type::NumericString, valid_numeric);
+         test_string_type(result, input, "PrintableString", Botan::ASN1_Type::PrintableString, valid_printable);
+         test_string_type(result, input, "Ia5String", Botan::ASN1_Type::Ia5String, valid_ia5);
+         test_string_type(result, input, "VisibleString", Botan::ASN1_Type::VisibleString, valid_visible);
+         test_string_type(result, input, "Utf8String", Botan::ASN1_Type::Utf8String, valid_utf8);
+
+         if(valid_utf8) {
+            try {
+               const Botan::ASN1_String str(input);
+               const auto expected_tag =
+                  valid_printable ? Botan::ASN1_Type::PrintableString : Botan::ASN1_Type::Utf8String;
+               result.test_u32_eq("String tagging categorization",
+                                  static_cast<uint32_t>(str.tagging()),
+                                  static_cast<uint32_t>(expected_tag));
+            } catch(const std::exception& ex) {
+               result.test_failure(Botan::fmt("default constructor unexpectedly rejected '{}': {}", input, ex.what()));
+            }
+         }
+
+         return result;
+      }
+
+   private:
+      void test_string_type(Test::Result& result,
+                            std::string_view input,
+                            std::string_view type,
+                            Botan::ASN1_Type tag,
+                            bool expected_valid) {
+         if(expected_valid) {
+            try {
+               const Botan::ASN1_String str(input, tag);
+               result.test_str_eq(Botan::fmt("{} constructor value", type), str.value(), input);
+
+               const auto enc = raw_encode_string(input, tag);
+               Botan::BER_Decoder dec(enc);
+               Botan::ASN1_String decoded;
+               decoded.decode_from(dec);
+               result.test_str_eq(Botan::fmt("{} decode value", type), decoded.value(), input);
+            } catch(const std::exception& e) {
+               result.test_failure(Botan::fmt("{} unexpectedly rejected '{}': {}", type, input, e.what()));
+            }
+         } else {
+            result.test_throws(Botan::fmt("{} constructor rejects", type),
+                               [&]() { const Botan::ASN1_String str(input, tag); });
+
+            result.test_throws(Botan::fmt("{} decode rejects", type), [&]() {
+               const auto enc = raw_encode_string(input, tag);
+               Botan::BER_Decoder dec(enc);
+               Botan::ASN1_String decoded;
+               decoded.decode_from(dec);
+            });
+         }
+      }
+
+      static std::vector<uint8_t> raw_encode_string(std::string_view input, Botan::ASN1_Type tag) {
+         std::vector<uint8_t> encoding;
+         Botan::DER_Encoder der(encoding);
+         der.add_object(tag, Botan::ASN1_Class::Universal, input);
+         return encoding;
+      }
+};
+
+BOTAN_REGISTER_TEST("asn1", "asn1_string_validation", ASN1_String_Validation_Tests);
+
+class ASN1_Printer_Tests final : public Test {
+   public:
+      std::vector<Test::Result> run() override {
+         Test::Result result("ASN1_Pretty_Printer");
+
+         const Botan::ASN1_Pretty_Printer printer;
+
+         const size_t num_tests = 8;
+
+         for(size_t i = 1; i <= num_tests; ++i) {
+            const std::string i_str = std::to_string(i);
+            const std::vector<uint8_t> input_data = Test::read_binary_data_file("asn1_print/input" + i_str + ".der");
+            const std::string expected_output = Test::read_data_file("asn1_print/output" + i_str + ".txt");
+
+            try {
+               const std::string output = printer.print(input_data);
+               result.test_str_eq("Test " + i_str, output, expected_output);
+            } catch(Botan::Exception& e) {
+               result.test_failure(Botan::fmt("Printing test {} failed with an exception: '{}'", i, e.what()));
+            }
+         }
+
+         return {result};
+      }
+};
+
+BOTAN_REGISTER_TEST("asn1", "asn1_printer", ASN1_Printer_Tests);
+
+class ASN1_Decoding_Tests final : public Text_Based_Test {
+   public:
+      ASN1_Decoding_Tests() : Text_Based_Test("asn1_decoding.vec", "Input,ResultBER", "ResultDER") {}
+
+      Test::Result run_one_test(const std::string& /*header*/, const VarMap& vars) override {
+         const auto input = vars.get_req_bin("Input");
+         const std::string expected_ber = vars.get_req_str("ResultBER");
+         const std::string expected_der = vars.get_opt_str("ResultDER", expected_ber);
+
+         Test::Result result("ASN1 decoding");
+
+         decoding_test(result, input, expected_ber, false);
+         decoding_test(result, input, expected_der, true);
+
+         return result;
+      }
+
+   private:
+      static void decoding_test(Test::Result& result,
+                                std::span<const uint8_t> input,
+                                std::string_view expected,
+                                bool require_der) {
+         const Botan::ASN1_Pretty_Printer printer(4096, 2048, true, 0, 60, 64, require_der);
+         const std::string mode = require_der ? "DER" : "BER";
+         std::ostringstream sink;
+
+         try {
+            printer.print_to_stream(sink, input.data(), input.size());
+
+            if(expected == "OK") {
+               result.test_success();
+            } else {
+               result.test_failure(Botan::fmt("Accepted invalid {} input, expected error {}", mode, expected));
+            }
+         } catch(const std::exception& e) {
+            if(expected == "OK") {
+               result.test_failure(Botan::fmt("Rejected valid {} input with {}", mode, e.what()));
+            } else {
+               // BER_Decoding_Error prepends "BER: " to the message
+               std::string msg = e.what();
+               if(msg.starts_with("BER: ")) {
+                  msg = msg.substr(5);
+               }
+               result.test_str_eq("error message", msg, expected);
+            }
+         }
+      }
+};
+
+BOTAN_REGISTER_TEST("asn1", "asn1_decoding", ASN1_Decoding_Tests);
+
+#endif
+
+}  // namespace
+
+}  // namespace Botan_Tests

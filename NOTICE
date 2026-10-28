@@ -1,0 +1,82 @@
+Flo State GPG — copyright and license notice
+=============================================
+
+Flo State GPG is a modified version (fork) of Flo State Native.
+
+Copyright (C) 2026 Flo State GPG contributors
+Copyright (C) Altimor and Flo State Native contributors
+Copyright (C) Joel (@joelbqz) and writer-computer contributors
+Copyright (C) Evgeny Pokhilko and libencryptmsg contributors
+Copyright (C) The Botan Authors
+Copyright (C) Andy Matuschak, Sparkle contributors and other Sparkle
+copyright holders (see Licenses/Sparkle-LICENSE.txt)
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+The full GPLv3 text is in LICENSE. The corresponding source for this build is
+this repository (including Package.swift, Sources/, vendor/ and scripts/). If a
+binary-only distribution is made, the distributor must also provide the
+corresponding source or a written offer as required by GPLv3 section 6.
+
+Upstream projects
+-----------------
+
+* Flo State Native — https://github.com/Altimor/flo-state
+  Commit used: 5e36d503395c4e58b3ebe4d3d9e740d45fa4b4b0
+  License: GNU GPL v3.0 or later. The Flo-State editor, UI, TextKit 2 code,
+  settings schema and bundled assets remain under their original licenses.
+
+* writer-computer — https://github.com/joelbqz/writer-computer
+  Flo State Native is a derivative work of writer-computer; its behaviour,
+  settings schema, themes and some bundled JavaScript/HTML assets are used
+  under GPL-3.0. See the original project and README.md for details.
+
+Native crypto libraries (statically linked into the app)
+--------------------------------------------------------
+
+* libencryptmsg — https://github.com/evpo/libencryptmsg
+  Commit: 1cfa8db9951a86ebe283cd3ecb1c88e6914ae4f0
+  Copyright (c) 2018, Evgeny Pokhilko <https://evpo.net/libencryptmsg>
+  License: Simplified BSD / BSD-2-Clause.
+  Full text: Licenses/libencryptmsg-BSD-2-Clause.txt.
+
+* Botan — https://github.com/randombit/botan
+  Version 3.13.0. Copyright (C) 1999-2026 The Botan Authors.
+  License: Simplified BSD / BSD-2-Clause.
+  Full text: Licenses/Botan-BSD-2-Clause.txt.
+
+* plog — https://github.com/SergiusTheBest/plog
+  Copyright (c) 2022 Sergey Podobry. MIT license.
+  Full text: Licenses/plog-MIT.txt.
+
+* state_machine — part of libencryptmsg's dependencies.
+  Copyright (c) 2018, Evgeny Pokhilko. BSD-2-Clause.
+  Full text: Licenses/state_machine-BSD-2-Clause.txt.
+
+* STLplus — http://stlplus.sourceforge.net/
+  BSD-style license. Full text: Licenses/STLplus-LICENSE.html.
+
+Frameworks and bundled web assets
+---------------------------------
+
+* Sparkle 2.10.0 — https://github.com/sparkle-project/Sparkle
+  MIT-style license; full text including third-party notices:
+  Licenses/Sparkle-LICENSE.txt.
+
+* KaTeX, CodeMirror/Lezer, beautiful-mermaid/elkjs/entities, DOMPurify and
+  CommonMark/GFM examples are distributed as bundled resources or ports as
+  described in README.md's License section. Their MIT / BSD-2-Clause /
+  EPL-2.0 / MPL-2.0-or-Apache-2.0 terms remain in force; the upstream project
+  README and the bundled resource directories identify the components.
+  Full third-party notices: THIRD_PARTY_NOTICES.md.
+
+The app bundle includes LICENSE, NOTICE, THIRD_PARTY_NOTICES.md and the
+Licenses/ directory in Contents/Resources so these notices travel with the
+binary.

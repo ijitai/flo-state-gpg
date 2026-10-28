@@ -1,0 +1,1 @@
+cgdb --args ./encryptmsg-test dbg.log --gtest_filter="InputMemoryStreamFixture.Bug_fix_When_reading_partial_portion_followed_by_portion_less_than_4_Then_stream_contains_correct_bytes"

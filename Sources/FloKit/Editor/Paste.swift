@@ -1,0 +1,162 @@
+import AppKit
+import UniformTypeIdentifiers
+import FloCore
+
+// Paste (use-prosemark-editor.ts paste handler): frontmatter paste, image
+// paste, rich HTML → markdown, then CodeMirror's plain-text paste.
+
+/// `MAX_IMAGE_SIZE`.
+let maxPasteImageSize = 5 * 1024 * 1024
+
+/// What a paste event carries (a `ClipboardEvent.clipboardData` view of an NSPasteboard).
+public struct PastePayload {
+    public var plain: String?
+    public var html: String?
+    /// First image item: data, `File.type` subtype ("png", "jpeg"...), `File.name`.
+    public var image: (data: Data, format: String, name: String)?
+    public init(plain: String? = nil, html: String? = nil, image: (data: Data, format: String, name: String)? = nil) {
+        self.plain = plain; self.html = html; self.image = image
+    }
+
+    /// Read a pasteboard the way WebKit exposes it to a paste event.
+    public static func read(_ pb: NSPasteboard) -> PastePayload {
+        var p = PastePayload()
+        p.plain = pb.string(forType: .string)
+        p.html = pb.string(forType: .html)
+        // Files (Finder copy): an image file is an image item named like the file.
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            for u in urls {
+                guard let t = UTType(filenameExtension: u.pathExtension), t.conforms(to: .image),
+                      let mime = t.preferredMIMEType, let data = try? Data(contentsOf: u) else { continue }
+                p.image = (data, String(mime.split(separator: "/").last ?? "png"), u.lastPathComponent)
+                return p
+            }
+            if !urls.isEmpty { return p }
+        }
+        // In-memory image data (screenshots, "Copy Image"). WebKit doesn't
+        // expose images alongside web content (HTML/RTF from a text copy).
+        let hasWebContent = pb.types?.contains(where: { $0 == .html || $0 == .rtf || $0 == .rtfd }) == true
+        if !hasWebContent {
+            if let d = pb.data(forType: .png) { p.image = (d, "png", "image.png") }
+            else if let d = pb.data(forType: NSPasteboard.PasteboardType("public.jpeg")) { p.image = (d, "jpeg", "image.jpeg") }
+            else if let d = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: d),
+                    let png = rep.representation(using: .png, properties: [:]) {
+                // WebKit hands TIFF clipboard images to the page as PNG
+                p.image = (png, "png", "image.png")
+            }
+        }
+        return p
+    }
+}
+
+extension EditorFeatures {
+    /// Paste from a pasteboard. `plain` = "Paste as plain text". Always handles.
+    @discardableResult
+    func paste(_ pb: NSPasteboard, plain: Bool) -> Bool {
+        if plain { performMenuAction("paste-plain", pasteboard: pb); return true }
+        paste(PastePayload.read(pb))
+        return true
+    }
+
+    /// The paste handler chain.
+    public func paste(_ p: PastePayload) {
+        if pasteFrontmatter(p) { return }
+        if pasteLinkOverSelection(p) { return }
+        if let img = p.image { pasteImage(img.data, format: img.format, name: img.name); return }
+        if pasteRichText(p) { return }
+        pastePlain(p.plain ?? "")
+    }
+
+    /// A URL pasted over selected text links the text: `[selection](url)`. Single-line selections only,
+    /// and not when the selection is itself a URL (then the paste just replaces it).
+    func pasteLinkOverSelection(_ p: PastePayload) -> Bool {
+        guard let raw = p.plain?.trimmingCharacters(in: .whitespacesAndNewlines), let url = Self.pastedURL(raw) else { return false }
+        let st = editor.state
+        let sel = st.selection.main
+        guard st.selection.ranges.count == 1, !sel.empty else { return false }
+        // only the line's text: a Shift-Cmd-Left selection includes the bullet / heading prefix
+        guard let span = Formatting.textSpan(st, sel.from, sel.to) else { return false }
+        let text = st.sliceDoc(span.from, span.to)
+        guard Self.pastedURL(text) == nil else { return false }
+        let md = "[\(text)](\(LinkPaths.formatMarkdownDestination(url)))"
+        editor.run { t in
+            t.dispatch(TransactionSpec(changes: [Change(from: span.from, to: span.to, insert: md)],
+                                       selection: .cursor(span.from + md.utf16.count), userEvent: "input.paste"))
+            return true
+        }
+        return true
+    }
+
+    /// A pasted string that is exactly one web / mail URL.
+    static func pastedURL(_ s: String) -> String? {
+        guard !s.isEmpty, !s.contains(where: { $0.isWhitespace }) else { return nil }
+        let lower = s.lowercased()
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") || lower.hasPrefix("mailto:"),
+              let u = URL(string: s), u.scheme != nil, lower.hasPrefix("mailto:") || u.host != nil else { return nil }
+        return s
+    }
+
+    /// `handleFrontmatterPaste`.
+    func pasteFrontmatter(_ p: PastePayload) -> Bool {
+        guard let text = p.plain, !text.isEmpty else { return false }
+        let parsed = Frontmatter.parse(text)
+        guard let fm = parsed.frontmatter else { return false }
+        guard let hook = frontmatterPaste, hook(fm) else { return false }
+        let body = parsed.body
+        if !body.isEmpty { editor.run { t in t.dispatch(t.state.replaceSelection(body)); return true } }
+        return true
+    }
+
+    /// `handleImagePaste`: save under `attachments/`, insert `![name](dest)` on its own
+    /// line and put the caret on the next line, so the image renders right away
+    /// (with the caret on its line it would stay as source).
+    func pasteImage(_ data: Data, format: String, name: String) {
+        guard data.count <= maxPasteImageSize, let doc = editor.documentPath else { return }
+        guard let saved = try? WorkspaceFS.saveClipboardImage(markdownFilePath: doc, data: data, format: format.isEmpty ? "png" : format) else { return }
+        let md = "![\(name)](\(LinkPaths.formatMarkdownDestination(saved.relativePath)))"
+        editor.run { t in
+            let sel = t.state.selection.main
+            let lineStart = t.state.doc.lineAt(sel.from).from == sel.from
+            let insert = (lineStart ? "" : "\n") + md + "\n"
+            t.dispatch(TransactionSpec(changes: [Change(from: sel.from, to: sel.to, insert: insert)],
+                                       selection: .cursor(sel.from + insert.utf16.count), userEvent: "input.paste"))
+            return true
+        }
+        editor.reloadImages()
+    }
+
+    /// `handleRichTextPaste`.
+    func pasteRichText(_ p: PastePayload) -> Bool {
+        guard let html = p.html, !html.isEmpty, HTMLToMarkdown.isWorthConverting(html) else { return false }
+        let md = HTMLToMarkdown.convert(html)
+        if md.isEmpty { return false }
+        if md == (p.plain ?? "") { return false }
+        editor.run { t in t.dispatch(t.state.replaceSelection(md)); return true }
+        return true
+    }
+
+    /// CodeMirror's own paste (`doPaste`): line separators normalized; one line
+    /// per range when the line count matches a multi-range selection.
+    func pastePlain(_ raw: String) {
+        if raw.isEmpty { return }
+        let text = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        editor.run { t in
+            let st = t.state
+            let lines = text.components(separatedBy: "\n")
+            var spec: TransactionSpec
+            if st.selection.ranges.count > 1 && lines.count == st.selection.ranges.count {
+                var i = 0
+                spec = st.changeByRange { r in
+                    let line = lines[i]; i += 1
+                    return ([Change(from: r.from, to: r.to, insert: line)], .cursor(r.from + line.utf16.count))
+                }
+            } else {
+                spec = st.replaceSelection(text)
+            }
+            spec.userEvent = "input.paste"
+            spec.scrollIntoView = true
+            t.dispatch(spec)
+            return true
+        }
+    }
+}

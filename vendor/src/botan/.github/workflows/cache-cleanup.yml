@@ -1,0 +1,41 @@
+
+# Delete all GitHub Actions caches scoped to a pull request when it is closed
+#
+# See: https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows
+
+name: cache-cleanup
+
+# WARNING be sure this workflow never accesses anything from the PR contents
+on:
+  pull_request_target:
+    types:
+      - closed
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Delete caches for closed PR
+    runs-on: ubuntu-24.04
+    permissions:
+      # Required for `gh cache delete`
+      actions: write
+      contents: read
+    steps:
+      - name: Delete caches scoped to this PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          for PR_REF in "refs/pull/${PR_NUMBER}/merge" "refs/pull/${PR_NUMBER}/head"; do
+             echo "Caches currently scoped to ${PR_REF}:"
+             if ! gh cache list --ref "${PR_REF}" --limit 100; then
+               echo "::warning::Unable to list caches for ${PR_REF}"
+             fi
+             if ! gh cache delete --all --ref "${PR_REF}"; then
+               echo "::warning::Unable to delete caches for ${PR_REF}"
+             fi
+           done

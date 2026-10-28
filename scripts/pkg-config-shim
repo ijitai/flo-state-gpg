@@ -1,0 +1,16 @@
+#!/bin/sh
+# Minimal pkg-config replacement for offline builds of libencryptmsg.
+# Only the queries its configure.py makes for zlib and bzip2 are answered;
+# both libraries come from the macOS SDK.
+for arg in "$@"; do
+  case "$arg" in
+    zlib) echo "-lz"; exit 0 ;;
+    bzip2) echo "-lbz2"; exit 0 ;;
+  esac
+done
+case "$*" in
+  *"--exists"*) exit 0 ;;
+  *"--cflags"*) exit 0 ;;
+  *"--libs"*) exit 0 ;;
+esac
+exit 0
